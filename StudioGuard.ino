@@ -3,8 +3,8 @@
 #include <U8x8lib.h>
 #include "DHT.h"
 #include <EEPROM.h>
-//#include <SPI.h>
-//#include <SPIFlash.h>
+#include <SPI.h>
+#include <Adafruit_SPIFlash.h>
 
 // Definicje pinów i komponentów
 #define ENCODER_PIN_A 2
@@ -18,18 +18,19 @@
 #define POTENTIOMETER_PIN A0
 #define OLED_MIN_BRIGHTNESS 0
 #define OLED_MAX_BRIGHTNESS 255
-
+#define ADDRESS_SECTOR 0x0000        // Sektor do przechowywania adresu
+#define DATA_START_SECTOR 0x1000    // Sektor danych (sektor 1 dla 4kB sektora)
 
 RTC_DS1307 rtc;
 
-//SPIFlash flash(FLASH_CS_PIN);
+Adafruit_FlashTransport_SPI flashTransport(FLASH_CS_PIN, SPI);
+Adafruit_SPIFlash flash(&flashTransport);
 DHT dht(DHTTYPE);  
 
 // Inicjalizacja OLED SSD1306 w trybie U8X8
 U8X8_SSD1306_128X64_NONAME_HW_I2C u8x8(/* reset=*/ U8X8_PIN_NONE);
 
 // Zmienne globalne
-//
 unsigned long buttonPressTime = 0;
 bool longPressActive = false;
 // Zmienne enkodera
@@ -46,6 +47,18 @@ struct Settings {
     float humMax;
     bool isCelsius = true;
 };
+// Struktura przechowująca dane do zapisu
+struct SensorData {
+    uint16_t year;   // 2 bajty
+    uint8_t month;   // 1 bajt
+    uint8_t day;     // 1 bajt
+    uint8_t hour;    // 1 bajt
+    uint8_t minute;  // 1 bajt
+    uint8_t second;  // 1 bajt
+    int16_t temperature; // 2 bajty (przechowujemy temperaturę *10, np. 23.4 jako 234)
+    uint8_t humidity;    // 1 bajt
+} __attribute__((packed));
+
 // Globalna zmienna do pracy z ustawieniami
 Settings deviceSettings;
 
@@ -56,11 +69,8 @@ bool isEdit = false;
 Screen currentScreen = SCREEN_DATA;  // Ekran startowy
 int currentMenuOption = 0;
 int currentSettingsOption = 0;
-int lastScreen = -1; // Śledzenie ostatniego ekranu, aby uniknąć niepotrzebnego odświeżania
-//bool isCelsius = true; // Flaga do przełączania jednostek
+
 int oldGroveButtonState = 0;
-
-
 int oldEncoderPinA = 0;
 int oldEncoderPinB = 0;
 int encoderDirection = 0;
@@ -69,20 +79,16 @@ int encoderDirection = 0;
 float temperature = 22.5;
 float humidity = 55.0;
 
-const uint32_t FLASH_SIZE = 8388608; // Rozmiar pamięci 8 MB (dla W25Q64)
-const uint32_t BLOCK_SIZE = 32;     // Blok danych na wpis: 32 bajty
-// Adresy pamięci Flash
-uint32_t writeAddress = 0;
-char logBuffer[BLOCK_SIZE];
-
 volatile uint16_t refreshCounter = 0;
-volatile uint16_t saveCounter = 0;
 volatile bool refreshFlag = false;
-volatile bool saveFlag = false;
-//float tempMin = 10;
-//float tempMax = 40;
-//float humMin = 30;
-//float humMax = 90;
+
+volatile bool isTransferActive = false; // Flaga dla trybu transferu danych
+volatile bool saveDataFlag = false;    // Flaga zapisu danych do Flash
+volatile uint16_t saveDataCounter = 0; // Licznik przerwań dla zapisu danych
+const uint16_t DATA_SAVE_INTERVAL_TICKS = 6; // 10 minut = 146 przerwań (~4,096 s/przerwanie)
+volatile uint32_t flashDataAddress = 0;         // Adres startowy dla zapisu danych na Flash
+const uint32_t FLASH_SIZE = 8388608; // Rozmiar pamięci 8 MB (dla W25Q64)
+
 // Ikona termometru (32x32 pikseli)
 const uint8_t ICON_THERMOMETER[] = {
   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xfc, 0xfe, 0x7e, 0xfc, 
@@ -109,23 +115,6 @@ const uint8_t ICON_GEAR[] = {
 
 void setup() {
   Serial.begin(9600);
-  // Inicjalizacja OLED
-  u8x8.begin();
-  u8x8.setFont(u8x8_font_amstrad_cpc_extended_f);
-  dht.begin();
-  // Inicjalizacja Flash
-  /*if (!flash.begin()) {
-      Serial.println("Błąd inicjalizacji pamięci Flash!");
-      while (1);
-  }
-  Serial.println("Pamięć Flash gotowa.");
-*/
-  // Inicjalizacja RTC
-  if (!rtc.begin()) {
-      Serial.println("Błąd inicjalizacji RTC!");
-      while (1);
-  }
-  //rtc.adjust(DateTime(2024, 12, 21, 1, 51, 0)); // Rok, miesiąc, dzień, godzina, minuta, sekunda
   // Konfiguracja pinów enkodera i przycisku
   pinMode(ENCODER_PIN_A, INPUT);
   pinMode(ENCODER_PIN_B, INPUT);
@@ -141,9 +130,26 @@ void setup() {
   digitalWrite(BUZZER_PIN, LOW);
   pinMode(POTENTIOMETER_PIN, INPUT);
 
-  delay(30);
+  // Inicjalizacja OLED
+  u8x8.begin();
+  u8x8.setFont(u8x8_font_amstrad_cpc_extended_f);
+  dht.begin();
+  
+  // Inicjalizacja RTC
+  if (!rtc.begin()) {
+      Serial.println("Błąd inicjalizacji RTC!");
+      while (1);
+  }
+  // Inicjalizacja pamięci Flash
+  if (!flash.begin()) {
+      Serial.println("Błąd inicjalizacji pamięci Flash!");
+      while (1);
+  }
+  initializeFlashDataAddress(); // Odczytaj ostatni adres zapisu
+
   temperature = dht.readTemperature();
   humidity = dht.readHumidity();
+
   loadSettingsFromEEPROM();
 
   displaySensorData();
@@ -153,7 +159,8 @@ void setup() {
   TCCR1B = (1 << CS12) | (1 << CS10); // Prescaler 1024
   TIMSK1 = (1 << TOIE1);          // Włącz przerwanie przepełnienia
   TCNT1 = 0;
-
+  //testFlashWrite(4);
+  //testFlashRead(4);
 }
 
 void loop() {
@@ -166,25 +173,34 @@ void loop() {
       if (currentScreen == SCREEN_DATA) { // Aktualizuj dane tylko na ekranie danych
           if (!isnan(humidity) && !isnan(temperature)) {
               updateDataScreen(); // Aktualizacja wyświetlacza
-              Serial.print(rtc.now().day());
-              Serial.print(".");
-              Serial.print(rtc.now().month());
-              Serial.print(".");
-              Serial.println(rtc.now().year());
-              Serial.print(rtc.now().hour());
-              Serial.print(":");
-              Serial.print(rtc.now().minute());
-              Serial.print(":");
-              Serial.println(rtc.now().second());
-              Serial.println(deviceSettings.tempMin);
-              Serial.println(deviceSettings.tempMax);
-              Serial.println(deviceSettings.humMin);
-              Serial.println(deviceSettings.humMax);
-              Serial.println(deviceSettings.isCelsius);
           } else {
               Serial.println("Błąd odczytu czujnika.");
           }
       }
+  }
+  // Zapis danych co 10 minut
+  if (saveDataFlag) {
+      saveDataFlag = false;
+      DateTime now = rtc.now();
+      saveDataToFlash(temperature, humidity, now);
+  }
+
+  // Sprawdzenie, czy jest sygnał 'T' do rozpoczęcia transferu danych
+  if (Serial.available() > 0) {
+    char command = Serial.read();
+    if (command == 'T') { // Sygnał 'T' wyzwala transfer
+      // Wyłącz alarmy natychmiast
+      digitalWrite(LED_PIN, LOW);
+      noTone(BUZZER_PIN);
+
+      // Wykonaj transfer danych
+      transferDataToPC();
+    }
+  }
+
+  // Jeśli transfer trwa, zakończ bieżące wykonanie pętli
+  if (isTransferActive) {
+      return; // Blokuj pozostałe operacje
   }
 
   checkLimits(); // Sprawdzanie limitów i alarmu
@@ -206,7 +222,7 @@ void loop() {
     if (newGroveButtonState == HIGH) {
       deviceSettings.isCelsius = !deviceSettings.isCelsius;
       updateDataScreen();
-      //errorMsg = "LOL";
+      saveSettingsToEEPROM();
     }
     oldGroveButtonState = newGroveButtonState;
     delay(50);
@@ -245,15 +261,6 @@ void handleEncoderButton() {
   }
 }
 
-/*void updateScreen() {
-    if (currentScreen == SCREEN_DATA) {
-        displaySensorData();
-    } else if (currentScreen == SCREEN_MENU) {
-        displayMenu();
-    } else if (currentScreen == SCREEN_SETTINGS) {
-        displaySettingsScreen();
-    }
-}*/
 void drawDataScreen() {
   u8x8.clear();
   
@@ -326,17 +333,6 @@ void readEncoder() {
   }
 }
 
-
-/*void handleEncoderMovement(int direction) {
-  if (currentScreen == SCREEN_MENU) {
-    // Zakładamy, że są 2 opcje w menu
-    currentMenuOption = (currentMenuOption + direction + 2) % 2; // Modulo 2 dla dwóch opcji
-  } else if (currentScreen == SCREEN_SETTINGS) {
-      // Zakładamy, że są 5 opcji w ustawieniach (indeksy od 0 do 4)
-      currentSettingsOption = (currentSettingsOption + direction + 5) % 5; // Modulo 5 dla pięciu opcji
-  }
-  updateScreen();
-}*/
 
 void displaySettingsScreen() {
   u8x8.clear();
@@ -442,84 +438,6 @@ void drawSettingLine(int index, bool highlight) {
     u8x8.setInverseFont(false); // Wyłączenie inwersji
 }
 
-
-/*
-// Funkcja obsługująca poruszanie się po opcjach ustawień
-void handleSettingsNavigation(int direction) {
-    if (!isEdit) {
-        // Przemieszczanie się między wierszami
-        drawSettingLine(currentSettingsOption, false); // Odznacz poprzednią linię
-        currentSettingsOption = (currentSettingsOption + direction + 5) % 5; // Modulo 5 dla 5 opcji
-        drawSettingLine(currentSettingsOption, true);  // Zaznacz nową linię
-    } else {
-        // Zmiana wartości w trybie edycji
-        switch (currentSettingsOption) {
-            case 0:
-                tempMin = constrain(tempMin + direction, -20, tempMax - 1); // Ograniczenie do zakresu i tempMax
-                break;
-            case 1:
-                tempMax = constrain(tempMax + direction, tempMin + 1, 100); // Ograniczenie do tempMin i maksymalnej wartości
-                break;
-            case 2:
-                humMin = constrain(humMin + direction, 0, humMax - 1); // Ograniczenie do wilgMax
-                break;
-            case 3:
-                humMax = constrain(humMax + direction, humMin + 1, 100); // Ograniczenie do wilgMin i maksymalnej wartości
-                break;
-            case 4:
-                if (direction != 0) isCelsius = !isCelsius; // Przełącz jednostki tylko przy zmianie
-                break;
-        }
-        drawSettingLine(currentSettingsOption, true); // Odśwież tylko zmienioną linię
-    }
-}
-
-
-void drawSettingLine(int index, bool highlight) {
-    char buffer[10];
-    u8x8.setInverseFont(highlight && !isEdit); // Inwersja całej linii tylko w trybie nawigacji
-
-    switch (index) {
-        case 0:
-            u8x8.setCursor(1, 1);
-            u8x8.print("Temp min: ");
-            if (isEdit && index == currentSettingsOption) u8x8.setInverseFont(true); // Inwersja wartości w trybie edycji
-            dtostrf(tempMin, 5, 1, buffer);
-            u8x8.print(buffer);
-            break;
-        case 1:
-            u8x8.setCursor(1, 2);
-            u8x8.print("Temp max: ");
-            if (isEdit && index == currentSettingsOption) u8x8.setInverseFont(true);
-            dtostrf(tempMax, 5, 1, buffer);
-            u8x8.print(buffer);
-            break;
-        case 2:
-            u8x8.setCursor(1, 4);
-            u8x8.print("Wilg min: ");
-            if (isEdit && index == currentSettingsOption) u8x8.setInverseFont(true);
-            dtostrf(humMin, 5, 1, buffer);
-            u8x8.print(buffer);
-            break;
-        case 3:
-            u8x8.setCursor(1, 5);
-            u8x8.print("Wilg max: ");
-            if (isEdit && index == currentSettingsOption) u8x8.setInverseFont(true);
-            dtostrf(humMax, 5, 1, buffer);
-            u8x8.print(buffer);
-            break;
-        case 4:
-            u8x8.setCursor(1, 7);
-            u8x8.print("Jednostki: ");
-            if (isEdit && index == currentSettingsOption) u8x8.setInverseFont(true);
-            u8x8.print(isCelsius ? "C" : "F");
-            break;
-    }
-
-    u8x8.setInverseFont(false); // Wyłączenie inwersji
-}
-*/
-
 // Funkcja obsługująca kliknięcie enkodera w ustawieniach
 void handleSettingsClick() {
     if (isEdit) {
@@ -532,43 +450,43 @@ void handleSettingsClick() {
 }
 
 void checkLimits() {
-    bool alarm = false;
+  bool alarm = false;
 
-    if (temperature < deviceSettings.tempMin || temperature > deviceSettings.tempMax) {
-        alarm = true;
+  if (temperature < deviceSettings.tempMin || temperature > deviceSettings.tempMax) {
+      alarm = true;
+  }
+
+  if (humidity < deviceSettings.humMin || humidity > deviceSettings.humMax) {
+      alarm = true;
+  }
+
+  if (alarm) {
+    // Włącz alarm: migająca dioda i zmienny ton buzzera
+    static bool ledState = false;
+    static unsigned long lastToggle = 0;
+    static unsigned long lastToneChange = 0;
+    static int buzzerTone = 440; // Startowy ton (440 Hz)
+    const int toneChangeInterval = 200; // Zmieniaj ton co 200 ms
+    unsigned long currentMillis = millis();
+
+    // Miganie diody co 500 ms
+    if (currentMillis - lastToggle >= 500) {
+        lastToggle = currentMillis;
+        ledState = !ledState;
+        digitalWrite(LED_PIN, ledState);
     }
 
-    if (humidity < deviceSettings.humMin || humidity > deviceSettings.humMax) {
-        alarm = true;
+    // Zmieniaj ton buzzera co 200 ms
+    if (currentMillis - lastToneChange >= toneChangeInterval) {
+        lastToneChange = currentMillis;
+        buzzerTone = (buzzerTone == 440) ? 880 : 440; // Przełączaj między 440 Hz a 880 Hz
+        tone(BUZZER_PIN, buzzerTone); // Generuj ton na pinie buzzera
     }
-
-    if (alarm) {
-        // Włącz alarm: migająca dioda i zmienny ton buzzera
-        static bool ledState = false;
-        static unsigned long lastToggle = 0;
-        static unsigned long lastToneChange = 0;
-        static int buzzerTone = 440; // Startowy ton (440 Hz)
-        const int toneChangeInterval = 200; // Zmieniaj ton co 200 ms
-        unsigned long currentMillis = millis();
-
-        // Miganie diody co 500 ms
-        if (currentMillis - lastToggle >= 500) {
-            lastToggle = currentMillis;
-            ledState = !ledState;
-            digitalWrite(LED_PIN, ledState);
-        }
-
-        // Zmieniaj ton buzzera co 200 ms
-        if (currentMillis - lastToneChange >= toneChangeInterval) {
-            lastToneChange = currentMillis;
-            buzzerTone = (buzzerTone == 440) ? 880 : 440; // Przełączaj między 440 Hz a 880 Hz
-            tone(BUZZER_PIN, buzzerTone); // Generuj ton na pinie buzzera
-        }
-    } else {
-        // Wyłącz alarm
-        digitalWrite(LED_PIN, LOW);
-        noTone(BUZZER_PIN); // Wyłącz buzzer
-    }
+  } else {
+      // Wyłącz alarm
+      digitalWrite(LED_PIN, LOW);
+      noTone(BUZZER_PIN); // Wyłącz buzzer
+  }
 }
 
 void adjustBrightness() {
@@ -590,7 +508,7 @@ void saveSettingsToEEPROM() {
     // Porównaj dane i zapisz tylko, jeśli są różne
     if (memcmp(&currentSettings, &deviceSettings, sizeof(Settings)) != 0) {
         EEPROM.put(EEPROM_SETTINGS_ADDR, deviceSettings);
-        Serial.println("Ustawienia zapisane do EEPROM.");
+        //Serial.println("Ustawienia zapisane do EEPROM.");
     } else {
         Serial.println("Brak zmian w ustawieniach. Nie zapisano do EEPROM.");
     }
@@ -611,27 +529,133 @@ void loadSettingsFromEEPROM() {
         deviceSettings.isCelsius = true;
         saveSettingsToEEPROM(); // Zapisz domyślne ustawienia
     }
-    Serial.println("Ustawienia załadowane z EEPROM.");
+    //Serial.println("Ustawienia załadowane z EEPROM.");
+}
+void saveDataToFlash(float temperature, float humidity, DateTime now) {
+  SensorData data;
+  data.year = now.year();
+  data.month = now.month();
+  data.day = now.day();
+  data.hour = now.hour();
+  data.minute = now.minute();
+  data.second = now.second();
+  data.temperature = (int16_t)(temperature * 10);
+  data.humidity = (uint8_t)humidity;
+
+  // Zapis danych do pamięci Flash
+  if (!flash.writeBuffer(flashDataAddress, (uint8_t *)&data, sizeof(SensorData))) {
+      Serial.println("Błąd zapisu danych do pamięci Flash!");
+      return;
+  }
+
+  // Dodanie jednego bajtu przerwy
+  uint8_t padding = 0xFF; // Domyślnie wypełniamy 0xFF
+  flash.writeBuffer(flashDataAddress + sizeof(SensorData), &padding, 1);
+
+  // Aktualizacja adresu zapisu
+  flashDataAddress += sizeof(SensorData) + 1; // Przesuwamy o rozmiar struktury + 1 bajt
+
+  if (flashDataAddress >= FLASH_SIZE) {
+      flashDataAddress = DATA_START_SECTOR; // Reset do początku danych (po kontrolnym)
+  }
+
+  saveFlashDataAddress(); // Zapis aktualnego adresu zapisu
 }
 
+void transferDataToPC() {
+  isTransferActive = true;
+  detachInterrupt(digitalPinToInterrupt(ENCODER_PIN_A));
+  detachInterrupt(digitalPinToInterrupt(ENCODER_PIN_B));
+
+  u8x8.clear();
+  u8x8.drawString(2, 3, "Transfer");
+  u8x8.drawString(2, 5, "danych");
+  uint32_t readAddress = DATA_START_SECTOR;
+
+  while (readAddress < flashDataAddress) {
+      SensorData data;
+      flash.readBuffer(readAddress, (uint8_t *)&data, sizeof(SensorData));
+      // Walidacja danych
+      if (data.year > 2000 && data.year < 2100 && data.month >= 1 && data.month <= 12) {
+          Serial.print(data.year);
+          Serial.print(",");
+          Serial.print(data.month);
+          Serial.print(",");
+          Serial.print(data.day);
+          Serial.print(",");
+          Serial.print(data.hour);
+          Serial.print(",");
+          Serial.print(data.minute);
+          Serial.print(",");
+          Serial.print(data.second);
+          Serial.print(",");
+          Serial.print(data.temperature / 10.0, 1);
+          Serial.print(",");
+          Serial.println(data.humidity);
+      } else {
+          Serial.println("Nieprawidłowe dane w pamięci Flash.");
+      }
+
+      // Przesuwamy adres odczytu o rozmiar struktury + 1 bajt
+      readAddress += sizeof(SensorData) + 1;
+      delay(50); // Unikaj przeciążenia łącza USB
+  }
+
+  flash.eraseChip(); // Czyszczenie pamięci Flash po transferze
+  flashDataAddress = DATA_START_SECTOR; // Reset adresu zapisu
+  saveFlashDataAddress(); // Zapisz zaktualizowany adres
+
+  u8x8.clear();
+  u8x8.drawString(2, 3, "Transfer");
+  u8x8.drawString(2, 5, "zakonczony");
+  delay(2000);
+
+  attachInterrupt(digitalPinToInterrupt(ENCODER_PIN_A), readEncoder, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENCODER_PIN_B), readEncoder, CHANGE);
+  isTransferActive = false;
+  displaySensorData();
+}
+
+void saveFlashDataAddress() {
+  uint32_t addressToSave = flashDataAddress;
+
+  // Wyczyszczenie sektora, w którym przechowywany jest adres
+  flash.eraseSector(ADDRESS_SECTOR); 
+
+  // Zapisz adres w pierwszych 4 bajtach sektora 0
+  flash.writeBuffer(ADDRESS_SECTOR, (uint8_t *)&addressToSave, sizeof(addressToSave));
+}
+void initializeFlashDataAddress() {
+    uint32_t savedAddress = 0;
+
+    // Odczytaj zapisany adres z pierwszych 4 bajtów sektora 0
+    flash.readBuffer(ADDRESS_SECTOR, (uint8_t *)&savedAddress, sizeof(savedAddress));
+
+    // Walidacja adresu
+    if (savedAddress >= DATA_START_SECTOR && savedAddress < FLASH_SIZE) {
+        flashDataAddress = savedAddress;
+    } else {
+        flashDataAddress = DATA_START_SECTOR; // Rozpocznij zapis od początku sektora danych
+        saveFlashDataAddress(); // Zapisz domyślny adres
+    }
+}
 
 ISR(TIMER1_OVF_vect) {
-    refreshCounter++;
-    
-    if (refreshCounter >= 3) { // ~12.57 sekundy przy preskalerze 1024
-        refreshFlag = true;
-        refreshCounter = 0;
-    }
+  refreshCounter++;
+  saveDataCounter++;
 
+  // Odświeżanie co ~12,57 sekundy
+  if (refreshCounter >= 3) {
+      refreshFlag = true;
+      refreshCounter = 0;
+  }
+
+  // Zapis danych co 10 minut (146 przerwań)
+  if (saveDataCounter >= DATA_SAVE_INTERVAL_TICKS) {
+      if (!isTransferActive) { // Zapis danych tylko, gdy transfer nie jest aktywny
+          saveDataFlag = true;
+      }
+      saveDataCounter = 0; // Reset licznika zapisu
+  }
 }
-//void handleEncoderButton() {
-//  if (inMenu) {
-//    if (currentScreen == 0) {
-//      inMenu = false; // Wyjście do ekranu danych
-//    } else if (currentScreen == 1) {
-//      // Przejście do ustawień
-//      Serial.println("Przejście do ustawień.");
-//    }
-//  }
-//}
 
