@@ -11,7 +11,7 @@
 #define ENCODER_PIN_B 3
 #define ENCODER_BUTTON 9
 #define GROVE_BUTTON 6
-#define DHTTYPE DHT10   // DHT 20
+#define DHTTYPE DHT10   // DHT 10
 #define FLASH_CS_PIN 10
 #define LED_PIN 4
 #define BUZZER_PIN 5
@@ -85,7 +85,7 @@ volatile bool refreshFlag = false;
 volatile bool isTransferActive = false; // Flaga dla trybu transferu danych
 volatile bool saveDataFlag = false;    // Flaga zapisu danych do Flash
 volatile uint16_t saveDataCounter = 0; // Licznik przerwań dla zapisu danych
-const uint16_t DATA_SAVE_INTERVAL_TICKS = 6; // 10 minut = 146 przerwań (~4,096 s/przerwanie)
+const uint16_t DATA_SAVE_INTERVAL_TICKS = 146; // 10 minut = 146 przerwań (~4,096 s/przerwanie)
 volatile uint32_t flashDataAddress = 0;         // Adres startowy dla zapisu danych na Flash
 const uint32_t FLASH_SIZE = 8388608; // Rozmiar pamięci 8 MB (dla W25Q64)
 
@@ -159,8 +159,6 @@ void setup() {
   TCCR1B = (1 << CS12) | (1 << CS10); // Prescaler 1024
   TIMSK1 = (1 << TOIE1);          // Włącz przerwanie przepełnienia
   TCNT1 = 0;
-  //testFlashWrite(4);
-  //testFlashRead(4);
 }
 
 void loop() {
@@ -322,7 +320,7 @@ void readEncoder() {
           delay(5);
       } else if (!oldEncoderPinA && !oldEncoderPinB && !newEncoderPinA && newEncoderPinB) {
           encoderDirection = -1; // Obrót w lewo
-          delay(0);
+          delay(5);
       }
 
       // Aktualizacja poprzednich stanów
@@ -508,7 +506,6 @@ void saveSettingsToEEPROM() {
     // Porównaj dane i zapisz tylko, jeśli są różne
     if (memcmp(&currentSettings, &deviceSettings, sizeof(Settings)) != 0) {
         EEPROM.put(EEPROM_SETTINGS_ADDR, deviceSettings);
-        //Serial.println("Ustawienia zapisane do EEPROM.");
     } else {
         Serial.println("Brak zmian w ustawieniach. Nie zapisano do EEPROM.");
     }
@@ -529,7 +526,6 @@ void loadSettingsFromEEPROM() {
         deviceSettings.isCelsius = true;
         saveSettingsToEEPROM(); // Zapisz domyślne ustawienia
     }
-    //Serial.println("Ustawienia załadowane z EEPROM.");
 }
 void saveDataToFlash(float temperature, float humidity, DateTime now) {
   SensorData data;
@@ -600,7 +596,7 @@ void transferDataToPC() {
       readAddress += sizeof(SensorData) + 1;
       delay(50); // Unikaj przeciążenia łącza USB
   }
-
+  Serial.println("#");
   flash.eraseChip(); // Czyszczenie pamięci Flash po transferze
   flashDataAddress = DATA_START_SECTOR; // Reset adresu zapisu
   saveFlashDataAddress(); // Zapisz zaktualizowany adres
